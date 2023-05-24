@@ -66,6 +66,7 @@ class LoadCommands(IntEnum):
     LC_BUILD_VERSION = 0x32
     LC_DYLD_EXPORTS_TRIE = 0x33 | LC_REQ_DYLD
     LC_DYLD_CHAINED_FIXUPS = 0x34 | LC_REQ_DYLD
+    LC_FILESET_ENTRY = 0x35 | LC_REQ_DYLD
 
 
 class MachoFiletype(IntEnum):

@@ -207,7 +207,7 @@ class MachO(Backend):
             # Start reading load commands
             lc_offset = (7 if self.arch.bits == 32 else 8) * 4
 
-            self._parse_load_commands(lc_offset)
+            self._parse_load_commands(lc_offset, self.ncmds, self.sizeofcmds)
 
         except OSError as e:
             log.exception(e)
@@ -244,19 +244,32 @@ class MachO(Backend):
         # TODO: Check properly, but for now libs are just used via force load libs anyway
         return True
 
-    def _parse_load_commands(self, lc_offset):
+    def _parse_load_commands(self, lc_offset, ncmds, sizeofcmds, is_fileset_entry=False):
         # Possible optimization: Remove all unecessary calls to seek()
         # Load commands have a common structure: First 4 bytes identify the command by a magic number
         # second 4 bytes determine the commands size. Everything after this generic "header" is command-specific
         # this makes parsing the commands easy.
         # The documentation for Mach-O is at
         # http://opensource.apple.com//source/xnu/xnu-1228.9.59/EXTERNAL_HEADERS/mach-o/loader.h
+
+        # "None" means all
+        allowed_commands = None
+        if is_fileset_entry:
+            allowed_commands = [
+                LC.LC_SYMTAB
+            ]
+
         binary_file = self._binary_stream
         count = 0
         offset = lc_offset
-        while count < self.ncmds and (offset - lc_offset) < self.sizeofcmds:
+        while count < ncmds and (offset - lc_offset) < sizeofcmds:
             count += 1
             (cmd, size) = self._unpack("II", binary_file, offset, 8)
+
+            # skip to next command if this is a fileset entry and we don't handle this command
+            if allowed_commands is not None and cmd not in allowed_commands:
+                offset += size
+                continue
 
             # check for segments that interest us
             if cmd in [LC.LC_SEGMENT, LC.LC_SEGMENT_64]:  # LC_SEGMENT,LC_SEGMENT_64
@@ -307,6 +320,9 @@ class MachO(Backend):
             elif cmd in [LC.LC_DYSYMTAB]:
                 # TODO: This probably relevant for library loading and symbols, but it isn't clear how yet
                 pass
+            elif cmd in [LC.LC_FILESET_ENTRY]:
+                log.debug("Found LC_FILESET_ENTRY @ %#x", offset)
+                self._load_lc_fileset_entry(binary_file, offset)
             else:
                 try:
                     command_name = LC(cmd)
@@ -317,10 +333,10 @@ class MachO(Backend):
             offset += size
 
         # Assertion to catch malformed binaries - YES this is needed!
-        if count < self.ncmds or (offset - lc_offset) < self.sizeofcmds:
+        if count < ncmds or (offset - lc_offset) < sizeofcmds:
             raise CLEInvalidBinaryError(
                 "Assertion triggered: {} < {} or {} < {}".format(
-                    count, self.ncmds, (offset - lc_offset), self.sizeofcmds
+                    count, ncmds, (offset - lc_offset), sizeofcmds
                 )
             )
 
@@ -703,7 +719,7 @@ class MachO(Backend):
         self._indexed_strtab = _indexed_strtab
 
         log.info("Parsing %s symbols", nsyms)
-        self._parse_symbols(self, f, nsyms, symoff)
+        self._parse_symbols(f, nsyms, symoff)
 
     def _parse_symbols(self, f, nsyms, symoff):
         # parse the symbol entries and create (unresolved) MachOSymbols.
@@ -993,6 +1009,19 @@ class MachO(Backend):
                     current_chain_addr += skip
                     if skip == 0:
                         break
+
+    def _load_lc_fileset_entry(self, f, offset):
+        log.debug("Parsing fileset entry")
+        (_, _, vmaddr, fileoff, entry_id, _) = self._unpack(
+            "2I2Q2I", f, offset, 32
+        )
+
+        (_, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags) = self._unpack(
+            "7I", f, fileoff, 28
+        )
+
+        lc_offset = fileoff + (7 if self.arch.bits == 32 else 8) * 4
+        self._parse_load_commands(lc_offset, ncmds, sizeofcmds, True)
 
     def get_symbol_by_address_fuzzy(self, address):
         """
