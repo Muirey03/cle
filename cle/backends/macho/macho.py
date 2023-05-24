@@ -124,8 +124,6 @@ class MachO(Backend):
         self.lazy_binding_blob: Optional[bytes] = None  # lazy binding information
         self.weak_binding_blob: Optional[bytes] = None  # weak binidng information
         self.rebase_blob: Optional[bytes] = None  # rebasing information
-        self.symtab_offset = None  # offset to the symtab
-        self.symtab_nsyms = None  # number of symbols in the symtab
         self.binding_done = False  # if true binding was already done and do_bind will be a no-op
         self.strtab: Optional[bytes] = None
         self._indexed_strtab: Optional[Dict[int, bytes]] = None
@@ -196,6 +194,8 @@ class MachO(Backend):
                 # A Library is loaded as a dependency, this is fine, the loader will map it to somewhere above the main
                 # binary, so we don't need to do anything
                 pass
+            elif self.filetype == MachoFiletype.MH_FILESET and self.arch.bits == 64:
+                self.linked_base = self.mapped_base = 0xFFFFFE0007004000
             else:
                 # This case is not explicitly supported yet.
                 # There are various other MachoFiletypes, which might have different quirks in their loading
@@ -225,8 +225,6 @@ class MachO(Backend):
 
         self._resolve_entry()
 
-        log.info("Parsing %s symbols", self.symtab_nsyms)
-        self._parse_symbols(binary_file)
         log.info("Parsing module init/term function pointers")
         self._parse_mod_funcs()
 
@@ -690,18 +688,24 @@ class MachO(Backend):
         self.strtab = self._read(f, stroff, strsize)
 
         # Create Dictionary of offsets to strings for quick lookups e.g. during later symbol creation
-        _indexed_strtab: Dict[int, bytes] = {}
-        idx = 0
+        _indexed_strtab: Dict[int, bytes] = None
+        if self._indexed_strtab == None:
+            _indexed_strtab = {}
+            idx = 0
+        else:
+            _indexed_strtab = self._indexed_strtab
+            max_idx = max(_indexed_strtab.keys())
+            idx = len(_indexed_strtab[max_idx]) + 1
+        
         for s in self.strtab.split(b"\x00"):
             _indexed_strtab[idx] = s
             idx += len(s) + 1
         self._indexed_strtab = _indexed_strtab
 
-        # store symtab info
-        self.symtab_nsyms = nsyms
-        self.symtab_offset = symoff
+        log.info("Parsing %s symbols", nsyms)
+        self._parse_symbols(self, f, nsyms, symoff)
 
-    def _parse_symbols(self, f):
+    def _parse_symbols(self, f, nsyms, symoff):
         # parse the symbol entries and create (unresolved) MachOSymbols.
         if self.arch.bits == 64:
             packstr = "I2BHQ"
@@ -710,10 +714,10 @@ class MachO(Backend):
             packstr = "I2BhI"
             structsize = 12
 
-        for i in range(0, self.symtab_nsyms):
+        for i in range(0, nsyms):
             # The relevant struct is nlist_64 which is defined and documented in mach-o/nlist.h
             offset_in_symtab = i * structsize
-            offset = offset_in_symtab + self.symtab_offset
+            offset = offset_in_symtab + symoff
             (n_strx, n_type, n_sect, n_desc, n_value) = self._unpack(packstr, f, offset, structsize)
             log.debug("Adding symbol # %d @ %#x: %s,%s,%s,%s,%s", i, offset, n_strx, n_type, n_sect, n_desc, n_value)
             sym = SymbolTableSymbol(self, offset_in_symtab, n_strx, n_type, n_sect, n_desc, n_value)
@@ -948,22 +952,6 @@ class MachO(Backend):
 
             starts_addr: FilePointer = segs_addr + segs[i]
             starts = self._get_struct(dyld_chained_starts_in_segment, starts_addr)
-
-            seg = self.find_segment_containing(starts.segment_offset)
-            # There are weird binaries where the offsets inside the file
-            # and inside the virtual addr space don't match anymore.
-            # This isn't properly supported yet, and the only known case is the __PII section inside the __ETC segment
-            # of rare binaries, which isn't that important for most purposes
-            shift = seg.vaddr - (seg.offset)
-            if shift != 0:
-                assert isinstance(seg, MachOSegment)
-                assert seg.segname == "__ETC", (
-                    "Only __ETC segments are known to have this shift, please open an"
-                    " issue for this binary so it can be investigated"
-                )
-                log.error("Segment shift detected in, not handling fixups here for now")
-                continue
-
             page_starts_data = self._read(self._binary_stream, starts_addr + 22, starts.page_count * 2)
             page_starts = struct.unpack("<" + ("H" * starts.page_count), page_starts_data)
 
@@ -1000,7 +988,8 @@ class MachO(Backend):
                     else:
                         raise CLEInvalidBinaryError("FixupPointer was neither bind nor rebase, that shouldn't happen")
 
-                    skip = chained_rebase_ptr.generic64.rebase.next * 4
+                    stride = chained_rebase_ptr.strideSize(pointer_format)
+                    skip = chained_rebase_ptr.generic64.rebase.next * stride
                     current_chain_addr += skip
                     if skip == 0:
                         break

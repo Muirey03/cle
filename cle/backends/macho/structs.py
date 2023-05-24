@@ -204,6 +204,51 @@ class Generic64(ctypes.Union):
 
 
 # noinspection PyPep8Naming
+class dyld_chained_ptr_64_kernel_cache_rebase(HelperStruct):
+    """
+    https://github.com/apple-opensource/dyld/blob/852.2/include/mach-o/fixup-chains.h#L200-L209
+    """
+
+    target: Union[FilePointer, FileOffset]
+    cacheLevel: int
+    diversity: int
+    addrDiv: int
+    key: int
+    next: int
+    isAuth: int
+
+    _fields_ = [
+        ("target", c_uint64, 30),
+        ("cacheLevel", c_uint64, 2),
+        ("diversity", c_uint64, 16),
+        ("addrDiv", c_uint64, 1),
+        ("key", c_uint64, 2),
+        ("next", c_uint64, 12),
+        ("isAuth", c_uint64, 1),
+    ]
+
+
+class Kernel64(ctypes.Union):
+    """
+    named after the Union `Kernel64` from dyld MachOLoaded.h
+    https://github.com/apple-opensource/dyld/blob/852.2/dyld3/MachOLoaded.h#L120-L122
+    """
+
+    rebase: dyld_chained_ptr_64_kernel_cache_rebase
+
+    _fields_ = [
+        ("rebase", dyld_chained_ptr_64_kernel_cache_rebase),
+    ]
+
+    @staticmethod
+    def check_valid_pointer_format(pointer_format: DyldChainedPtrFormats) -> bool:
+        return pointer_format in [
+            DyldChainedPtrFormats.DYLD_CHAINED_PTR_64_KERNEL_CACHE,
+            DyldChainedPtrFormats.DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE,
+        ]
+
+
+# noinspection PyPep8Naming
 class ChainedFixupPointerOnDisk(ctypes.Union):
     """
     the ChainedFixupPointerOnDisk union from dyld MachOLoaded.h
@@ -213,7 +258,7 @@ class ChainedFixupPointerOnDisk(ctypes.Union):
     generic64: Generic64
     arm64e: Arm64e
 
-    _fields_ = [("generic64", Generic64), ("arm64e", Arm64e)]
+    _fields_ = [("generic64", Generic64), ("arm64e", Arm64e), ("kernel64", Kernel64)]
 
     def isBind(self, pointer_format: DyldChainedPtrFormats) -> Optional[Tuple[int, int]]:
         """
@@ -232,6 +277,9 @@ class ChainedFixupPointerOnDisk(ctypes.Union):
                 return self.generic64.bind.ordinal, self.generic64.bind.addend
             else:
                 return None
+        elif Kernel64.check_valid_pointer_format(pointer_format):
+            # https://github.com/apple-opensource/dyld/blob/e3f88907bebb8421f50f0943595f6874de70ebe0/dyld3/MachOLoaded.cpp#L1140-L1142
+            return None
 
         else:
             raise NotImplementedError(f"Not yet supported pointer format {pointer_format}")
@@ -262,6 +310,32 @@ class ChainedFixupPointerOnDisk(ctypes.Union):
                 if pointer_format == DyldChainedPtrFormats.DYLD_CHAINED_PTR_64:
                     targetRuntimeOffset -= preferredLoadAddress
                 return targetRuntimeOffset
+        elif Kernel64.check_valid_pointer_format(pointer_format):
+            return self.kernel64.rebase.target
+
+        else:
+            raise NotImplementedError(f"Not yet supported pointer format {pointer_format}")
+    
+    def strideSize(
+        self, pointer_format: DyldChainedPtrFormats
+    ) -> int:
+        """
+        port of ChainedFixupPointerOnDisk::strideSize(uint16_t pointerFormat)
+        https://github.com/apple-opensource/dyld/blob/852.2/dyld3/MachOLoaded.cpp#L1149-L1169
+        :param pointer_format:
+        :return:
+        """
+        # pylint: disable=no-else-raise
+        if Arm64e.check_valid_pointer_format(pointer_format):
+            return 8
+        elif Generic64.check_valid_pointer_format(pointer_format):
+            return 4
+        elif Kernel64.check_valid_pointer_format(pointer_format):
+            if pointer_format == DyldChainedPtrFormats.DYLD_CHAINED_PTR_X86_64_KERNEL_CACHE:
+                return 1
+            else:
+                return 4
+
         else:
             raise NotImplementedError(f"Not yet supported pointer format {pointer_format}")
 
